@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#set -x
+
+usage() {
+  echo "Usage: $(basename "$0") [-h] [-n] [-p <aws profile>] [-s <stage>] <file>
+
+Uploads <file> to the cloud storage of translation files.
+
+Options:
+    -h  show this help text
+    -n  dry run
+    -s  stage (default: 'dev')
+    -p  name of AWS profile to use (default: 'default')"
+  [ ! -z "$1" ] && echo "Error: $1"
+  exit 1
+}
+
+profileOpt=""
+stackname="real-dev-frontend-resources"
+dryrunEcho=""
+dryrunOpt=""
+while getopts ':hnp:s:' option; do
+  case "$option" in
+    h) usage
+       ;;
+    n) dryrunEcho="(DRYRUN) "
+       dryrunOpt="--dryrun"
+       ;;
+    p) profileOpt="--profile $OPTARG"
+       ;;
+    s) stackname="real-$OPTARG-frontend-resources"
+       ;;
+    :) usage "option requires argument -$OPTARG"
+       ;;
+    *) usage "illegal option -$OPTARG"
+       ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+filepath="$1"
+if [ -z "$filepath" ]; then
+  usage "no file to upload specified"
+fi
+
+if [ ! -f "$filepath" ]; then
+  usage "file '$filepath' not found"
+fi
+filename=$(basename $filepath)
+
+if [ -z $(command -v aws) ]; then
+  >&2 echo "Error: AWS command line tools must be installed https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html"
+  exit 1
+fi
+
+bucketOutputKey="S3FrontendResourcesBucketName"
+domainOutputKey="CloudFrontFrontendResourcesDomainName"
+distributionIdOutputKey="CloudFrontFrontendResourcesDistributionId"
+
+getCloudFormationOutput() {
+  [ -z "$1" ] && echo "Usage: getFormationOutput <outputKey>" && exit 1
+  outputKey="$1"
+  stackDetails=$(aws cloudformation describe-stacks $profileOpt --stack-name "$stackname")
+  if [ "$?" != "0" ]; then
+    >&2 echo "Error: Unable to access AWS CloudFormation stack '"$stackname"' using AWS credentials with '"$profileOpt"'"
+    exit 1
+  fi
+  outputValue=$(echo "$stackDetails" | grep -A 1 "$outputKey" | tail -n 1 | cut -d ':' -f 2 | tr -d ' "')
+  echo "$outputValue"
+}
+
+bucket=$(getCloudFormationOutput $bucketOutputKey)
+[ "$?" != "0" ] && exit 1
+domain=$(getCloudFormationOutput $domainOutputKey)
+[ "$?" != "0" ] && exit 1
+distributionId=$(getCloudFormationOutput $distributionIdOutputKey)
+[ "$?" != "0" ] && exit 1
+
+path="translations/$filename"
+s3Url="s3://$bucket/$path"
+cloudfrontUrl="https://$domain/$path"
+
+echo -n "${dryrunEcho}Uploading \`$filepath\` to \`$s3Url\`..."
+aws s3 cp $dryrunOpt $profileOpt --content-type application/json "$filepath" "$s3Url" > /dev/null
+echo " uploaded."
+
+echo -n "${dryrunEcho}Creating invalidation for CloudFront path \`/$path\`..."
+if [ -z "$dryrunOpt" ]; then
+  aws cloudfront create-invalidation $profileOpt --distribution-id "$distributionId" --paths "/$path" > /dev/null
+fi
+echo " created."
+
+echo "${dryrunEcho}File available for download at \`$cloudfrontUrl\`"
